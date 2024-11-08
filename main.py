@@ -1,4 +1,5 @@
 import pickle
+import json
 
 import streamlit as st
 import numpy as np
@@ -15,6 +16,8 @@ from sklearn.tree import DecisionTreeClassifier
 
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
+
+from uml_utils import *
 
 
 st.set_page_config(layout="wide", page_title="ALU Platform")
@@ -54,7 +57,6 @@ def initialize_session_state():
         st.session_state.feature_names = None
     if 'labels' not in st.session_state:
         st.session_state.labels = []
-
 
 def preview_data(data, label_column=None):
     """Display a preview of the uploaded data"""
@@ -113,6 +115,22 @@ def update_plot():
         showlegend=True
     )
     return fig
+
+def display_metric(name, before_value, after_value):
+    if before_value is None or after_value is None:
+        st.metric(name, after_value if after_value is not None else "N/A")
+        return
+    
+    delta = after_value - before_value
+    delta_str = f"{delta:.2%}" if delta != 0 else "No Change"
+    delta_color = "green" if delta > 0 else "red" if delta < 0 else "off"
+    
+    st.metric(name, f"{after_value:.2%}", delta_str, delta_color)
+
+def calculate_delta(before, after):
+    if before is not None and after is not None:
+        return round(after - before, 3)
+    return 'N/A'
 
 
 def main():
@@ -309,6 +327,102 @@ def main():
         reset_session()
         st.rerun()
 
+    if st.session_state.learner and st.session_state.remaining_queries == 0:
+        st.header("Machine Unlearning")
+        uploaded_file_unlearn = st.file_uploader("Upload a Data for Unlearning", type="csv")
+        if uploaded_file_unlearn:
+            data_unlearning = pd.read_csv(uploaded_file_unlearn)
+            targeted_col = label_column
+            features = [col for col in data_unlearning.columns if col != targeted_col]
+            X = data_unlearning[features]
+            y = data_unlearning[targeted_col]
+
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            model_name = st.selectbox("Select Model", SISA.AVAILABLE_MODELS.keys())
+            n_shards = st.slider("Number of Shards", 1, 10, 5)
+            n_estimators = st.slider("Number of Estimators (for ensemble models)", 1, 100, 10)
+            selection_strategy = st.selectbox("Unlearning Strategy", ["random", "feature_based"])
+
+            strategy_params = None
+            if selection_strategy == "random":
+                strategy_params = {"n_samples": st.number_input("Number of Samples to Forget", 1, 100, 10)}
+            elif selection_strategy == "feature_based":
+                feature = st.selectbox("Feature", X_train.columns)
+                operator = st.selectbox("Operator", ["gt", "lt", "eq", "between"])
+                value = st.text_input("Value")
+                if operator == "between":
+                    try:
+                        value = json.loads(value)
+                        assert len(value) == 2
+                    except:
+                        st.write("Enter two values in the format: [min, max]")
+                strategy_params = {'conditions':[{'feature': feature, 'operator': operator, 'value': int(value)}]}
+
+            if st.button("Run Expriment"):
+                report = run_experiment(X_train, X_test, y_train, y_test, model_name=model_name, selection_strategy=selection_strategy, strategy_params=strategy_params, n_shards=n_shards, n_estimators=n_estimators)
+                st.success("Machine Unlearning Successful")
+                st.write("Experiment Report")
+                st.download_button("Download this Report", json.dumps(report), 'report.json')
+                #st.json(report)
+
+                #print(report['metrics_before_unlearning']['accuracy'])
+                #print(report)
+
+                
+
+                # Displaying metrics with delta in a two-column layout within each expander
+                with st.expander("Before Unlearning Metrics"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Accuracy", report['metrics_before_unlearning'].get('accuracy', 'N/A'))
+                        st.metric("Recall", report['metrics_before_unlearning'].get('recall', 'N/A'))
+                    with col2:
+                        st.metric("Precision", report['metrics_before_unlearning'].get('precision', 'N/A'))
+                        st.metric("F1 Score", report['metrics_before_unlearning'].get('f1', 'N/A'))
+
+                with st.expander("After Unlearning Metrics"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Accuracy", report['metrics_after_unlearning'].get('accuracy', 'N/A'),
+                                delta=calculate_delta(report['metrics_before_unlearning'].get('accuracy'),
+                                                        report['metrics_after_unlearning'].get('accuracy')))
+                        st.metric("Recall", report['metrics_after_unlearning'].get('recall', 'N/A'),
+                                delta=calculate_delta(report['metrics_before_unlearning'].get('recall'),
+                                                        report['metrics_after_unlearning'].get('recall')))
+                    with col2:
+                        st.metric("Precision", report['metrics_after_unlearning'].get('precision', 'N/A'),
+                                delta=calculate_delta(report['metrics_before_unlearning'].get('precision'),
+                                                        report['metrics_after_unlearning'].get('precision')))
+                        st.metric("F1 Score", report['metrics_after_unlearning'].get('f1', 'N/A'),
+                                delta=calculate_delta(report['metrics_before_unlearning'].get('f1'),
+                                                        report['metrics_after_unlearning'].get('f1')))
+
+                with st.expander("Experiment Details"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Model Name", report['experiment_details'].get('model_name', 'N/A'))
+                        st.metric("Samples Forgotten", report['experiment_details'].get('samples_forgotten', 'N/A'))
+                    with col2:
+                        st.metric("Affected Shards", report['experiment_details'].get('affected_shards', 'N/A'))
+                
+
+                # st.sidebar.header("Machine Unlearning Metrics")
+                # st.sidebar.subheader("Before Unlearning Metrics")
+                # st.sidebar.metric("Accuracy",report['metrics_before_unlearning']['accuracy'])
+                # st.sidebar.metric("Precision",report['metrics_before_unlearning']['precision'])
+                # st.sidebar.metric("Recall",report['metrics_before_unlearning']['recall'])
+                # st.sidebar.metric("F1",report['metrics_before_unlearning']['f1'])
+                
+                # st.sidebar.subheader("After Unlearning Metrics")
+                # st.sidebar.metric("Accuracy",report['metrics_after_unlearning']['accuracy'])
+                # st.sidebar.metric("Precision",report['metrics_after_unlearning']['precision'])
+                # st.sidebar.metric("Recall",report['metrics_after_unlearning']['recall'])
+                # st.sidebar.metric("F1",report['metrics_after_unlearning']['f1'])
+
+                # st.sidebar.subheader("Expriment Deatils")
+                # st.sidebar.metric("Model Name",report['experiment_details']['model_name'])
+                # st.sidebar.metric("Samples Forgotten",report['experiment_details']['samples_forgotten'])
+                # st.sidebar.metric("Affected Shards",report['experiment_details']['affected_shards'])
 
 if __name__ == "__main__":
     main()
