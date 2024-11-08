@@ -6,3 +6,4 @@ streamlit
 tqdm
 pandas
 plotly
+modal-python
