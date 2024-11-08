@@ -1,367 +1,314 @@
- import streamlit as st
+import pickle
+
+import streamlit as st
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
-from modAL.models import ActiveLearner
-from modAL.uncertainty import uncertainty_sampling, entropy_sampling, margin_sampling
+import plotly.graph_objects as go
 
-# Initialize models dictionary
-models = {
-    'Logistic Regression': LogisticRegression(random_state=42),
-    'SVM': SVC(probability=True, random_state=42),
+from modAL.models import ActiveLearner
+from modAL.uncertainty import uncertainty_sampling, margin_sampling, entropy_sampling
+
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier
+
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+
+
+st.set_page_config(layout="wide", page_title="ALU Platform")
+
+# Dictionary of available estimators
+ESTIMATORS = {
     'Decision Tree': DecisionTreeClassifier(random_state=42),
-    'Random Forest': RandomForestClassifier(random_state=42)
+    'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
+    'Gradient Boosting': GradientBoostingClassifier(random_state=42),
+    'SVM': SVC(probability=True, random_state=42),
+    'KNN': KNeighborsClassifier(n_neighbors=5)
+}
+
+# Dictionary of query strategies
+QUERY_STRATEGIES = {
+    'Uncertainty Sampling': uncertainty_sampling,
+    'Margin Sampling': margin_sampling,
+    'Entropy Sampling': entropy_sampling
 }
 
 
-@st.cache_data
-def data_preprocessing(df, target):
-    """
-    Preprocess the data with caching for better performance
-    """
-    X = df.drop(target, axis=1)
-    y = df[target].str.lower().values if df[target].dtype == 'object' else df[target].values
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5, random_state=42)
-
-    sc = StandardScaler()
-    X_train = sc.fit_transform(X_train)
-    X_test = sc.transform(X_test)
-
-    return X_train, y_train, X_test, y_test
-
-
-def reset_session_state():
-    """
-    Reset all session state variables
-    """
-    keys_to_remove = ['learner', 'X_train', 'y_train', 'current_query',
-                      'initial_score', 'scores', 'form1', 'form2']
-    for key in keys_to_remove:
-        if key in st.session_state:
-            del st.session_state[key]
+def initialize_session_state():
+    """Initialize session state variables"""
+    if 'accuracy_scores' not in st.session_state:
+        st.session_state.accuracy_scores = []
+    if 'current_query' not in st.session_state:
+        st.session_state.current_query = 0
+    if 'learner' not in st.session_state:
+        st.session_state.learner = None
+    if 'query_strategy' not in st.session_state:
+        st.session_state.query_strategy = uncertainty_sampling
+    if 'remaining_queries' not in st.session_state:
+        st.session_state.remaining_queries = 0
+    if 'label_column' not in st.session_state:
+        st.session_state.label_column = None
+    if 'feature_names' not in st.session_state:
+        st.session_state.feature_names = None
+    if 'labels' not in st.session_state:
+        st.session_state.labels = []
 
 
-# Page configuration
-st.set_page_config(layout="wide", page_title="Active Learning Platform")
+def preview_data(data, label_column=None):
+    """Display a preview of the uploaded data"""
+    st.info(f"Number of rows: {len(data)}", icon=":material/table_rows:")
+    st.info(f"Number of columns: {len(data.columns)}", icon=":material/view_column:")
+    st.write("### Data Preview")
+    st.write(data.head())
 
-# Add CSS for better styling
-st.markdown("""
-    <style>
-    .stButton>button {
-        width: 100%;
-    }
-    .success-message {
-        padding: 1rem;
-        border-radius: 0.5rem;
-        background-color: #dcffe4;
-        color: #0c5460;
-    }
-    </style>
-    """, unsafe_allow_html=True)
 
-st.title("Learn and Unlearn: Active Learning and Machine Unlearning No-Code Platform")
+def process_uploaded_file(uploaded_file, label_column=None):
+    """Process uploaded CSV file and return features and labels if present"""
+    data = pd.read_csv(uploaded_file)
 
-# Add a reset button at the top
-if st.button("Reset Application"):
-    reset_session_state()
-    st.rerun()
+    # Store feature names
+    st.session_state.feature_names = data.columns.tolist()
 
-# File uploaders with error handling
-try:
-    data = st.file_uploader('Upload your Labeled Data (CSV)', type=['csv'])
-    unlabeled_data = st.file_uploader("Upload your Unlabeled Data (CSV)", type=['csv'])
-except Exception as e:
-    st.error(f"Error loading files: {str(e)}")
-    st.stop()
+    # Preview the data
+    preview_data(data, label_column)
 
-if data is not None:
-    try:
-        dataframe = pd.read_csv(data)
+    # Check if label column exists and process accordingly
+    if label_column and label_column in data.columns:
+        X = data.drop(label_column, axis=1)
+        y = data[label_column]
+        le = LabelEncoder()
+        y = le.fit_transform(y)
+        st.session_state.feature_names.remove(label_column)
+    else:
+        X = data
+        y = None
 
-        with st.form('options_menu'):
-            st.subheader('Select your Preferences')
-            col1, col2 = st.columns(2)
+    return X.values, y
 
-            with col1:
-                target = st.selectbox("Select the Target Feature",
-                                      dataframe.columns,
-                                      help="Choose the column you want to predict")
 
-            with col2:
-                model = st.selectbox("Select your ML model",
-                                     list(models.keys()),
-                                     help="Choose the machine learning algorithm")
+def reset_session():
+    """Reset all session state variables"""
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    initialize_session_state()
 
-            submit = st.form_submit_button(label='Submit')
 
-            if not submit and not st.session_state.get('form1'):
-                st.stop()
+def update_plot():
+    """Update the accuracy plot"""
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=list(range(len(st.session_state.accuracy_scores))),
+        y=st.session_state.accuracy_scores,
+        mode='lines+markers',
+        name='Accuracy'
+    ))
 
-            st.session_state['form1'] = True
+    fig.update_layout(
+        title='Model Accuracy Over Queries',
+        xaxis_title='Number of Queries',
+        yaxis_title='Accuracy',
+        yaxis=dict(range=[0, 1]),
+        showlegend=True
+    )
+    return fig
 
-        # Process data and display dataset info
-        X_train, y_train, X_test, y_test = data_preprocessing(dataframe, target)
-        labels = np.unique(y_train)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.header('Dataset Preview')
-            st.dataframe(dataframe.head(), use_container_width=True)
-        with col2:
-            st.header('Dataset Info')
-            st.write(f"Total samples: {len(dataframe)}")
-            st.write(f"Features: {dataframe.drop(target, axis=1).columns.tolist()}")
-            st.write(f"Number of classes: {len(labels)}")
-            st.write(f"Classes: {labels.tolist()}")
+def main():
+    st.title('ALU: Active Learning Meets Machine Unlearning')
 
-        st.subheader('Active Learning')
-        if unlabeled_data is not None:
+    # Initialize session state
+    initialize_session_state()
+
+    # Sidebar configuration
+    st.sidebar.header('ALU Configurations')
+    st.sidebar.subheader('Active Learning')
+
+    # Model selection
+    selected_model = st.sidebar.selectbox(
+        'Select Classifier',
+        list(ESTIMATORS.keys())
+    )
+
+    # Query strategy selection
+    selected_strategy = st.sidebar.selectbox(
+        'Select Query Strategy',
+        list(QUERY_STRATEGIES.keys())
+    )
+
+    # Number of queries
+    n_queries = st.sidebar.number_input('Number of Queries', 1, 100, 10)
+
+    # Files uploader
+    st.header('Data Upload')
+
+    col1, col2 = st.columns(2)
+    with col1:
+        # Labeled data upload section
+        st.subheader("Upload Labeled Dataset")
+        labeled_file = st.file_uploader("Upload Labeled Dataset (CSV)", type=['csv'], key='labeled')
+
+    # Label column selection
+    label_column = None
+    if labeled_file:
+        # Read the CSV to get column names
+        df_preview = pd.read_csv(labeled_file)
+        label_column = st.selectbox(
+            "Select the Label Column",
+            options=df_preview.columns.tolist(),
+            key='label_column_key'
+        )
+        # Reset file pointer
+        labeled_file.seek(0)
+
+    with col2:
+        # Unlabeled data upload section
+        st.subheader("Upload Unlabeled Dataset")
+        unlabeled_file = st.file_uploader(
+            "Upload Unlabeled Dataset (CSV)",
+            type=['csv'],
+            key='unlabeled'
+        )
+
+    # Process uploaded files and initialize learner
+    if labeled_file and unlabeled_file and label_column and st.button('Start Active Learning'):
+        with st.spinner('Processing datasets...'):
             try:
-                X_pool = pd.read_csv(unlabeled_data).values
-                max_queries = X_pool.shape[0]
 
-                with st.form('active_learning'):
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        al_strategy = st.selectbox(
-                            "Select Active Learning Strategy",
-                            ['Uncertainty', 'Entropy', 'Margin'],
-                            help="Choose the strategy for selecting new samples"
-                        )
-
-                    with col2:
-                        queries = st.number_input(
-                            "Number of queries:",
-                            min_value=1,
-                            max_value=max_queries,
-                            value=min(5, max_queries),
-                            help="Number of samples to label"
-                        )
-
-                    strategies = {
-                        'Uncertainty': uncertainty_sampling,
-                        'Entropy': entropy_sampling,
-                        'Margin': margin_sampling
-                    }
-
-                    al_submit = st.form_submit_button(label='Start Active Learning')
-
-                    if not al_submit and not st.session_state.get('form2'):
-                        st.stop()
-                    st.session_state['form2'] = True
-
-                # Initialize or retrieve learner from session state
-                if 'learner' not in st.session_state:
-                    with st.spinner('Initializing model...'):
-                        st.session_state.learner = ActiveLearner(
-                            estimator=models[model],
-                            query_strategy=strategies[al_strategy],
-                            X_training=X_train,
-                            y_training=y_train
-                        )
-                        st.session_state.learner.teach(X_train, y_train)
-                        st.session_state.X_train = X_train.copy()
-                        st.session_state.y_train = y_train.copy()
-                        st.session_state.current_query = 0
-                        st.session_state.initial_score = st.session_state.learner.score(X_test, y_test)
-                        st.session_state.scores = [st.session_state.initial_score]
-
-                # Create two columns for scores and progress
                 col1, col2 = st.columns(2)
                 with col1:
-                    st.metric("Initial Score", f"{st.session_state.initial_score:.4f}")
+                    st.header("Labeled Dataset Info")
+                    # Process labeled data
+                    X_labeled, y_labeled = process_uploaded_file(labeled_file, label_column)
+                    st.session_state.labels = y_labeled
+
                 with col2:
-                    st.metric("Progress", f"{st.session_state.current_query}/{queries} queries")
+                    st.header("Unlabeled Dataset Info")
+                    # Process unlabeled data
+                    X_unlabeled, _ = process_uploaded_file(unlabeled_file)
 
-                # Active learning interface
-                if st.session_state.current_query < queries:
-                    query_idx, query_sample = st.session_state.learner.query(X_pool)
+                st.divider()
 
-                    st.write("### Label New Sample")
-                    query_label = st.selectbox(
-                        "Select label for this sample:",
-                        options=labels,
-                        key=f"query_{st.session_state.current_query}",
-                        help="Choose the correct label for this sample"
-                    )
+                # Validate feature consistency
+                if X_labeled.shape[1] != X_unlabeled.shape[1]:
+                    st.error("Error: The number of features in labeled and unlabeled datasets must match!")
+                    return
 
-                    # Display sample features in a more readable format
-                    st.write("Sample features:")
-                    sample_df = pd.DataFrame(query_sample.reshape(1, -1),
-                                             columns=dataframe.drop(target, axis=1).columns)
-                    st.dataframe(sample_df, use_container_width=True)
+                # Split labeled data into training and test sets
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X_labeled, y_labeled,
+                    test_size=0.5,
+                    random_state=42
+                )
 
-                    if st.button("Submit Label", key=f"submit_{st.session_state.current_query}"):
-                        with st.spinner('Updating model...'):
-                            st.session_state.learner.teach(query_sample.reshape(1, -1), [query_label])
-                            st.session_state.X_train = np.vstack([st.session_state.X_train, query_sample])
-                            st.session_state.y_train = np.append(st.session_state.y_train, query_label)
-                            current_score = st.session_state.learner.score(X_test, y_test)
-                            st.session_state.scores.append(current_score)
-                            st.session_state.current_query += 1
-                            st.rerun()
+                # Initialize active learner
+                st.session_state.learner = ActiveLearner(
+                    estimator=ESTIMATORS[selected_model],
+                    query_strategy=QUERY_STRATEGIES[selected_strategy],
+                    X_training=X_train,
+                    y_training=y_train
+                )
 
-                # Display scores history
-                if len(st.session_state.scores) > 1:
-                    st.write("### Learning Progress")
-                    progress_df = pd.DataFrame({
-                        'Iteration': range(len(st.session_state.scores)),
-                        'Score': st.session_state.scores
-                    })
-                    st.line_chart(progress_df.set_index('Iteration'))
+                # Store necessary variables in session state
+                st.session_state.X_pool = X_unlabeled
+                st.session_state.X_test = X_test
+                st.session_state.y_test = y_test
+                st.session_state.remaining_queries = n_queries
+                st.session_state.accuracy_scores = []
+                st.session_state.current_query = 0
+                st.session_state.label_column = label_column
 
-                # Show completion message
-                if st.session_state.current_query >= queries:
-                    st.success("Active learning process completed!")
-                    st.write(f"Final Score: {st.session_state.scores[-1]:.4f}")
-                    st.write(f"Total Improvement: {(st.session_state.scores[-1] - st.session_state.initial_score):.4f}")
-
+                st.success('Active learner initialized successfully!')
             except Exception as e:
-                st.error(f"Error in active learning process: {str(e)}")
-                st.stop()
-
-    except Exception as e:
-        st.error(f"Error processing data: {str(e)}")
-        st.stop()
+                st.error(f"Error initializing active learner: {str(e)}")
 
 
+    # Active learning loop
+    if st.session_state.learner is not None and st.session_state.remaining_queries > 0:
+        st.header('Active Learning')
+
+        # Get next query instance
+        query_idx, query_inst = st.session_state.learner.query(
+            st.session_state.X_pool,
+            n_instances=1
+        )
+
+        # Display instance features
+        st.subheader("Annotate Label for Queries")
+        query_dict = {}
+        for i, value in enumerate(query_inst[0]):
+            feature_name = st.session_state.feature_names[i] if st.session_state.feature_names else f"Feature {i + 1}"
+            query_dict[feature_name] = value
+
+        st.dataframe(pd.DataFrame(query_dict, index=['Query Sample']))
 
 
+        # Get user input
+        label = st.radio(
+            "Select label for this instance:",
+            options=np.unique(st.session_state.labels),
+            key=f"query_{st.session_state.current_query}"
+        )
+
+        if st.button('Submit Label'):
+            # Teach the model
+            st.session_state.learner.teach(
+                query_inst.reshape(1, -1),
+                np.array([label], dtype=int)
+            )
+
+            # Update pool
+            st.session_state.X_pool = np.delete(
+                st.session_state.X_pool,
+                query_idx,
+                axis=0
+            )
+
+            # Calculate and store accuracy
+            accuracy = st.session_state.learner.score(
+                st.session_state.X_test,
+                st.session_state.y_test
+            )
+
+            st.session_state.accuracy_scores.append(accuracy)
+
+            # Update counters
+            st.session_state.current_query += 1
+            st.session_state.remaining_queries -= 1
+
+            # Force rerun to update the display
+            st.rerun()
 
 
+    if st.session_state.learner:
+        st.plotly_chart(update_plot(), use_container_width=True)
+
+    if st.session_state.learner:
+        st.download_button("Download this Model", pickle.dumps(st.session_state.learner.estimator), 'model.bin')
+
+    # Display statistics in sidebar
+    st.sidebar.subheader("Training Statistics")
+    st.sidebar.metric("Queries Completed", len(st.session_state.accuracy_scores))
+
+    if st.session_state.accuracy_scores:
+
+        acc_list = st.session_state.accuracy_scores
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.sidebar.metric("Current Accuracy", np.round(acc_list[-1], 4),
+                          delta=np.round(acc_list[-1] - acc_list[-2], 2)
+                          if st.session_state.current_query > 1 else 0)
+
+        with col2:
+            st.sidebar.metric("Best Accuracy", np.round(max(acc_list), 4))
+
+    # Reset button
+    if st.sidebar.button('Reset Application'):
+        reset_session()
+        st.rerun()
 
 
-
-
-
-
-
-
-
-# models = {'Logistic Regression': LogisticRegression(), 'SVM': SVC(), 'Decision Tree': DecisionTreeClassifier(),'Random Forest': RandomForestClassifier()}
-#
-# def data_preprocessing(df, target):
-#     X = df.drop(target, axis=1)
-#     y = df[target].str.lower().values
-#     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-#
-#     sc = StandardScaler()
-#     X_train = sc.fit_transform(X_train)
-#     X_test = sc.transform(X_test)
-#
-#     return X_train, y_train, X_test, y_test
-#
-#
-# st.set_page_config(layout="wide")
-# st.title("Learn and Unlearn: Active Learning and Machine Unlearning No-Code Platform")
-#
-# data = st.file_uploader('Upload your Labeled Data')
-# unlabeled_data = st.file_uploader("Upload your Unlabeled Data")
-#
-# if data is not None:
-#     dataframe = pd.read_csv(data)
-#
-#     with st.form('options_menu'):
-#         st.subheader('Select your Preferences')
-#         target = st.selectbox("Select the Target Feature", dataframe.columns)
-#         model = st.selectbox("Select your ML model", ['Logistic Regression', 'SVM', 'Decision Tree', 'Random Forest'])
-#         submit = st.form_submit_button(label='Submit')
-#
-#         if not submit and not st.session_state.get('form1'):
-#             st.stop()
-#
-#         st.session_state['form1'] = True
-#
-#     X_train, y_train, X_test, y_test = data_preprocessing(dataframe, target)
-#     labels = np.unique(y_train)
-#
-#     st.header('Dataset')
-#     st.dataframe(dataframe)
-#
-#     st.subheader('Active Learning')
-#     if unlabeled_data is not None:
-#         X_pool = pd.read_csv(unlabeled_data).values
-#         max_queries = X_pool.shape[0]
-#
-#         with st.form('active_learning'):
-#             al_strategy = st.selectbox("Select your Desired Active Learning Strategy",
-#                                        ['Uncertainty', 'Entropy', 'Margin'])
-#             strategies = {'Uncertainty': uncertainty_sampling,
-#                           'Entropy': entropy_sampling,
-#                           'Margin': margin_sampling}
-#             queries = st.number_input("Enter the desired number of queries (No. of datapoints to Label):", 0,
-#                                       max_queries)
-#             al_submit = st.form_submit_button(label='Submit')
-#
-#             if not al_submit and not st.session_state.get('form2'):
-#                 st.stop()
-#             st.session_state['form2'] = True
-#
-#         # Initialize the model and session state variables after forms are submitted
-#         if 'learner' not in st.session_state:
-#             st.session_state.learner = ActiveLearner(
-#                 estimator=models[model],
-#                 query_strategy=strategies[al_strategy],
-#                 X_training=X_train,
-#                 y_training=y_train
-#             )
-#             st.session_state.learner.teach(X_train, y_train)
-#             st.session_state.X_train = X_train.copy()
-#             st.session_state.y_train = y_train.copy()
-#             st.session_state.current_query = 0
-#             st.session_state.initial_score = st.session_state.learner.score(X_test, y_test)
-#             st.session_state.scores = [st.session_state.initial_score]
-#
-#         # Display initial score
-#         st.write(f"Initial Score: {st.session_state.initial_score}")
-#
-#         # Only proceed if we haven't completed all queries
-#         if st.session_state.current_query < queries:
-#             # Get the next sample to label
-#             query_idx, query_sample = st.session_state.learner.query(X_pool)
-#
-#             # Create the select box for labeling
-#             label_key = f"query_{st.session_state.current_query}"
-#             query_label = st.selectbox(
-#                 f"Enter the label for this sample: {query_sample}:",
-#                 options=labels,
-#                 key=label_key
-#             )
-#
-#             # Add a submit button for this label
-#             if st.button("Submit Label", key=f"submit_{st.session_state.current_query}"):
-#                 # Update the model with new labeled data
-#                 st.session_state.learner.teach(query_sample.reshape(1, -1), [query_label])
-#
-#                 # Update training data
-#                 st.session_state.X_train = np.vstack([st.session_state.X_train, query_sample])
-#                 st.session_state.y_train = np.append(st.session_state.y_train, query_label)
-#
-#                 # Calculate and store new score
-#                 current_score = st.session_state.learner.score(X_test, y_test)
-#                 st.session_state.scores.append(current_score)
-#
-#                 # Increment query counter
-#                 st.session_state.current_query += 1
-#
-#                 # Force a rerun to update the interface
-#                 st.rerun()
-#
-#         # Display progress and scores
-#         st.write(f"Completed {st.session_state.current_query} out of {queries} queries")
-#
-#         # Show all scores in a line
-#         if len(st.session_state.scores) > 1:
-#             st.write("### Scores History")
-#             for i, score in enumerate(st.session_state.scores):
-#                 st.write(f"Score after iteration {i}: {score}")
-#
-#         # Show completion message
-#         if st.session_state.current_query >= queries:
-#             st.success("Active learning process completed!")
+if __name__ == "__main__":
+    main()
